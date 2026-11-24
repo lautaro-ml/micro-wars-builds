@@ -713,9 +713,16 @@ const C = defineConstants({
     value: { src: 'assets/music.flac', variants: 'assets/music', gain: 0.5,
       // D34, his "vary on pitch and intensity every 2 to 4 loops ... either or both": a segment lasts
       // loops[0]..loops[1] loops; a change moves the pitch, the intensity or both, never to the value
-      // it had. HOLDING, placeholders 2026-11-23: three intensities from a soft muffled one to the
-      // full track (gain on top of MUSIC.gain, low-pass cutoff in Hz); rampS the glide at a boundary;
-      // lookaheadS how far ahead loops are booked on the audio clock
+      // it had. rampS the glide at a boundary; lookaheadS how far ahead loops are booked on the audio
+      // clock
+      // D36, his "Keep the intensity range at 5 levels of bearly perceptible changes": five levels,
+      // softest first, each stepDb below the next (1 dB: the amplitude JND, "around 1 dB", Wikipedia
+      // "Just-noticeable difference", citing Middlebrooks & Green 1991 and Mills 1960), so the span is
+      // 4 dB, about the 4.4 dB the old three-level gain spanned; a change moves one level. A level is a
+      // low-pass cutoff plus a gain, and the gain is derived (audio.js levelGain) so the two together
+      // land on the step: filterDbA is the track's A-weighted level change through that cutoff,
+      // measured by tools/measure-intensity.py (2026-11-23). The cutoffs HOLDING, placeholders
+      // 2026-11-23: chosen so the filter's share of any step stays under half of it, the rest gain.
       // D35, his "make 20 variants, I want a wide range with short jumps half a semitone steps at most
       // 2 step jumps each variant is one step" after "tone shifts don't drift tempo": halfSteps the
       // range in half semitones (-10..10 is -5..+5 semitones: the original and 20 variants, rendered at
@@ -723,8 +730,8 @@ const C = defineConstants({
       // change, his 2. crossfadeS HOLDING, placeholder 2026-11-23: the fade at a pitch switch, above the
       // ~10 ms under which a waveform step clicks and far under one beat (0.667 s at 90 BPM), so no
       // attack doubles
-      vary: { loops: [2, 4], halfSteps: [-10, 10], maxStep: 2, crossfadeS: 0.03, levels: [{ gain: 0.6, cutoffHz: 1800 }, { gain: 0.8, cutoffHz: 5000 }, { gain: 1, cutoffHz: 20000 }], rampS: 0.6, lookaheadS: 2 } },
-    unit: 'src: the track, relative to the page (tools/build.mjs embeds this file in the one-file page); variants: the folder of its pitch loops (<variants>/m10.opus .. p10.opus); gain: linear amplitude 0..1 on the track; halfSteps and maxStep in half semitones; crossfadeS, rampS, lookaheadS in audio-clock seconds',
+      vary: { loops: [2, 4], halfSteps: [-10, 10], maxStep: 2, crossfadeS: 0.03, stepDb: 1, levels: [{ cutoffHz: 3300, filterDbA: -1.16 }, { cutoffHz: 4500, filterDbA: -0.76 }, { cutoffHz: 6000, filterDbA: -0.29 }, { cutoffHz: 8000, filterDbA: 0.11 }, { cutoffHz: 20000, filterDbA: 0.06 }], rampS: 0.6, lookaheadS: 2 } },
+    unit: 'src: the track, relative to the page (tools/build.mjs embeds this file in the one-file page); variants: the folder of its pitch loops (<variants>/m10.opus .. p10.opus); gain: linear amplitude 0..1 on the track; halfSteps and maxStep in half semitones; stepDb in dB between neighbouring intensity levels; levels[].cutoffHz in Hz, levels[].filterDbA the measured A-weighted change in dB; crossfadeS, rampS, lookaheadS in audio-clock seconds',
     derivation: 'His track, 2026-11-23 (D32): "add this as background music" (his export Hip-hop _boom-bap_.wav, 12.67 s, 48 kHz stereo). Encoded as FLAC, lossless, so the decoded loop repeats sample for sample, with +13 dB so its peak sits at -2.9 dBFS (it was -15.9; mean -23.1 dBFS after). gain HOLDING, placeholder 2026-11-23: 0.5 is -6 dB, putting the mean near -29 dBFS, under the foreground of a phone\'s media volume; the player\'s own control is the phone\'s volume and the Music setting. One owner for the path: the build and the dev page both read src here.',
   },
   CELL_SHAPES: {
@@ -3910,18 +3917,32 @@ function pitchMoves(half) {
   return out;
 }
 
+// the levels one intensity change can reach (D36): the neighbours, one step each way, so no change is
+// more than one barely perceptible step. Never empty: the ends keep their one neighbour.
+function levelMoves(level) {
+  const n = C.MUSIC.vary.levels.length;
+  return [level - 1, level + 1].filter((i) => i >= 0 && i < n);
+}
+// a level's gain on top of MUSIC.gain (D36): the loudest level is 0 dB with its filter, and each
+// level below sits stepDb under the next, the filter's own measured change (filterDbA) taken out of
+// the gain, so filter and gain together land on the step
+function levelGain(level) {
+  const V = C.MUSIC.vary, L = V.levels[level];
+  const db = -(V.levels.length - 1 - level) * V.stepDb - L.filterDbA;
+  return Math.pow(10, db / 20);
+}
+
 // The next segment after `cur` ({ loops, half, level }, half in half steps, level an index into
 // C.MUSIC.vary.levels): it lasts 2, 3 or 4 loops, uniform, and changes the pitch, the intensity or
 // both, uniform over the three kinds. A pitch change is uniform over pitchMoves; an intensity change
-// over the two other levels. Pure: the harness tests it.
+// over levelMoves. Pure: the harness tests it.
 function nextSegment(rng, cur) {
   const V = C.MUSIC.vary;
   const kind = rng.pick(['pitch', 'intensity', 'both']);
-  const levelIdx = V.levels.map((_, i) => i).filter((i) => i !== cur.level);
   return {
     loops: rng.int(V.loops[0], V.loops[1]),
     half: kind === 'intensity' ? cur.half : rng.pick(pitchMoves(cur.half)),
-    level: kind === 'pitch' ? cur.level : rng.pick(levelIdx),
+    level: kind === 'pitch' ? cur.level : rng.pick(levelMoves(cur.level)),
     kind,
   };
 }
@@ -3965,7 +3986,7 @@ function createMusic(srcFor, gain, seedName) {
 
   function applyLevel(at) {
     const L = V.levels[seg.level];
-    vary.gain.setTargetAtTime(L.gain, at, V.rampS / RAMP_TIME_CONSTANTS);
+    vary.gain.setTargetAtTime(levelGain(seg.level), at, V.rampS / RAMP_TIME_CONSTANTS);
     tone.frequency.setTargetAtTime(L.cutoffHz, at, V.rampS / RAMP_TIME_CONSTANTS);
   }
   function source(buffer, at, offset) {
