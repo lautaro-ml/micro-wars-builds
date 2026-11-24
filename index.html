@@ -709,7 +709,14 @@ const C = defineConstants({
   },
 
   MUSIC: {
-    value: { src: 'assets/music.flac', gain: 0.5 },
+    value: { src: 'assets/music.flac', gain: 0.5,
+      // D34, his "vary on pitch and intensity every 2 to 4 loops ... either or both": a segment lasts
+      // loops[0]..loops[1] loops; a change moves the pitch, the intensity or both, never to the value
+      // it had. HOLDING, placeholders 2026-11-23: semitones within a whole tone each way (the loop's
+      // tempo moves with its pitch, 6% a semitone); three intensities from a soft muffled one to the
+      // full track (gain on top of MUSIC.gain, low-pass cutoff in Hz); rampS the glide at a boundary;
+      // lookaheadS how far ahead loops are booked on the audio clock
+      vary: { loops: [2, 4], semitones: [-2, -1, 0, 1, 2], levels: [{ gain: 0.6, cutoffHz: 1800 }, { gain: 0.8, cutoffHz: 5000 }, { gain: 1, cutoffHz: 20000 }], rampS: 0.6, lookaheadS: 2 } },
     unit: 'src: the track, relative to the page (tools/build.mjs embeds this file in the one-file page); gain: linear amplitude 0..1 on the track',
     derivation: 'His track, 2026-11-23 (D32): "add this as background music" (his export Hip-hop _boom-bap_.wav, 12.67 s, 48 kHz stereo). Encoded as FLAC, lossless, so the decoded loop repeats sample for sample, with +13 dB so its peak sits at -2.9 dBFS (it was -15.9; mean -23.1 dBFS after). gain HOLDING, placeholder 2026-11-23: 0.5 is -6 dB, putting the mean near -29 dBFS, under the foreground of a phone\'s media volume; the player\'s own control is the phone\'s volume and the Music setting. One owner for the path: the build and the dev page both read src here.',
   },
@@ -3860,35 +3867,96 @@ function saveSettings(storage, st) {
 }
 
 // ---- src/audio.js ----
-// cellwar · sound (D32): the one owner of everything the game plays, which today is one track.
-// The track is decoded once and looped by an AudioBufferSourceNode, which repeats the decoded samples
-// exactly (an <audio loop> element can leave a gap at the seam). A browser and the Android WebView let
-// sound start only inside a user gesture, so nothing plays until unlock() runs inside one; main.js
-// calls it on every press, and after the first it costs nothing. Without Web Audio (the harness's
-// stub page) every call does nothing and the game plays on silent.
-//
-// createMusic(src, gain): src a URL the page can fetch (the one-file page passes the track embedded
-// as a data URI; the dev page its file), gain the track's level (C.MUSIC.gain).
-function createMusic(src, gain) {
+// cellwar · sound (D32, D34): the one owner of everything the game plays, which today is one track.
+// The track is one loop (assets/music.flac, cut at its musical length with its tail folded onto the
+// start, so loops join without a gap). Loops are booked back to back on the audio clock
+// (AudioContext.currentTime), each its own AudioBufferSourceNode starting where the last one ends,
+// so a loop at another pitch still joins without a gap. Every 2 to 4 loops (C.MUSIC.vary) the music
+// changes its pitch, its intensity or both (his D34 rule; listener fatigue is appreciation falling
+// with repeated exposure, and varying the rendering is the remedy the game-music literature names).
+// The plan is drawn from a seeded stream (src/rng.js) whose seed is new each launch and logged.
+// A browser and the Android WebView let sound start only inside a user gesture, so nothing plays
+// until unlock() runs inside one. Without Web Audio (the harness's stub page) every call does nothing.
+
+const SEMITONES_PER_OCTAVE = 12;   // equal temperament: a semitone is a rate of 2^(1/12)
+const START_DELAY_S = 0.05;        // the first loop is booked this far ahead, so its start is never in the past
+const BOOK_EVERY_MS = 250;         // the booking check; well inside lookaheadS, so a loop is always booked in time
+const RAMP_TIME_CONSTANTS = 3;     // setTargetAtTime reaches 95% of the change in 3 time constants: rampS / 3 each
+
+// The next segment after `cur` ({ loops, semitones, level }, level an index into C.MUSIC.vary.levels):
+// it lasts 2, 3 or 4 loops, uniform, and changes the pitch, the intensity or both, uniform over the
+// three kinds, each changed value drawn from the others (never the value it had: 4 of 5 pitches, 2 of
+// 3 intensities remain, so the draw always has somewhere to go). Pure: the harness tests it.
+function nextSegment(rng, cur) {
+  const V = C.MUSIC.vary;
+  const kind = rng.pick(['pitch', 'intensity', 'both']);
+  const other = (list, now) => rng.pick(list.filter((v) => v !== now));
+  const levelIdx = V.levels.map((_, i) => i);
+  return {
+    loops: rng.int(V.loops[0], V.loops[1]),
+    semitones: kind === 'intensity' ? cur.semitones : other(V.semitones, cur.semitones),
+    level: kind === 'pitch' ? cur.level : other(levelIdx, cur.level),
+    kind,
+  };
+}
+function firstSegment(rng) {
+  const V = C.MUSIC.vary;
+  return { loops: rng.int(V.loops[0], V.loops[1]), semitones: 0, level: V.levels.length - 1, kind: 'start' };
+}
+
+// createMusic(src, gain, seedName): src a URL the page can fetch (the one-file page passes the track
+// embedded as a data URI; the dev page its file), gain the track's level, seedName the stream's name.
+function createMusic(src, gain, seedName) {
   const AC = typeof window !== 'undefined' ? (window.AudioContext || window.webkitAudioContext) : null;
-  let ac = null, out = null, buffer = null, source = null, on = true, hidden = false;
-  const state = { loaded: false, playing: false, seconds: 0, error: null };
+  const V = C.MUSIC.vary;
+  const rng = makeRng(seedName);
+  let ac = null, out = null, vary = null, tone = null, buffer = null, on = true, hidden = false, timer = null;
+  let seg = firstSegment(rng), left = seg.loops, nextAt = 0;
+  const booked = [];
+  const state = { loaded: false, playing: false, seconds: 0, error: null, seed: seedName, segments: 1, segment: seg };
+
+  function applyLevel(at) {
+    const L = V.levels[seg.level];
+    vary.gain.setTargetAtTime(L.gain, at, V.rampS / RAMP_TIME_CONSTANTS);
+    tone.frequency.setTargetAtTime(L.cutoffHz, at, V.rampS / RAMP_TIME_CONSTANTS);
+  }
+  // books every loop that starts within lookaheadS of now, changing segment when one runs out
+  function book() {
+    if (!ac || !buffer || !on || hidden) return;
+    while (nextAt < ac.currentTime + V.lookaheadS) {
+      if (left === 0) {
+        seg = nextSegment(rng, seg); left = seg.loops; state.segments++; state.segment = seg;
+        applyLevel(nextAt);
+      }
+      const s = ac.createBufferSource(), rate = Math.pow(2, seg.semitones / SEMITONES_PER_OCTAVE);
+      s.buffer = buffer; s.playbackRate.value = rate;
+      s.connect(tone); s.start(nextAt);
+      s.onended = () => { const i = booked.indexOf(s); if (i >= 0) booked.splice(i, 1); };
+      booked.push(s);
+      nextAt += buffer.duration / rate; left--;
+    }
+  }
   function play() {
-    if (!ac || !buffer || source || !on || hidden) return;
-    source = ac.createBufferSource();
-    source.buffer = buffer; source.loop = true;
-    source.connect(out); source.start();
-    state.playing = true;
+    if (!ac || !buffer || !on || hidden || state.playing) return;
+    nextAt = ac.currentTime + START_DELAY_S; applyLevel(ac.currentTime);
+    state.playing = true; book();
+    timer = setInterval(book, BOOK_EVERY_MS);
   }
   function stop() {
-    if (!source) return;
-    try { source.stop(); } catch { /* already stopped */ }
-    source.disconnect(); source = null; state.playing = false;
+    if (timer) { clearInterval(timer); timer = null; }
+    for (const s of booked.splice(0)) { try { s.stop(); } catch { /* not started */ } s.disconnect(); }
+    state.playing = false;
   }
   function unlock() {
     if (!AC || state.error) return;
     if (!ac) {
-      try { ac = new AC(); out = ac.createGain(); out.gain.value = gain; out.connect(ac.destination); } catch (e) { state.error = String(e); return; }
+      try {
+        ac = new AC();
+        tone = ac.createBiquadFilter(); tone.type = 'lowpass';
+        vary = ac.createGain(); out = ac.createGain(); out.gain.value = gain;
+        tone.connect(vary); vary.connect(out); out.connect(ac.destination);
+      } catch (e) { state.error = String(e); return; }
+      console.info(`cellwar: music seed ${seedName}`);
       fetch(src).then((r) => r.arrayBuffer()).then((b) => ac.decodeAudioData(b)).then((b) => {
         buffer = b; state.loaded = true; state.seconds = b.duration; play();
       }).catch((e) => { state.error = String(e); console.info(`cellwar: the music could not load (${e}); the game plays on silent`); });
@@ -3903,7 +3971,8 @@ function createMusic(src, gain) {
     if (ac && ac.state === 'suspended' && !hidden) ac.resume();
     play();
   }
-  // a page the player left (the phone switched app, the screen went off): the whole context sleeps
+  // a page the player left (the phone switched app, the screen went off): the whole context sleeps,
+  // and the booked loops wait with its clock
   function setHidden(h) {
     hidden = !!h;
     if (!ac) return;
@@ -3946,7 +4015,10 @@ const ctl = {
 const renderer = createRenderer(canvas);
 // the background track (D32): the one-file page carries it embedded (CELLWAR_MUSIC, written by the
 // build); the dev page fetches the file itself
-const music = createMusic(typeof CELLWAR_MUSIC === 'string' ? CELLWAR_MUSIC : C.MUSIC.src, C.MUSIC.gain);
+// the music's variation stream (D34): a new seed each launch, so every session shifts differently;
+// the launch time and one draw of the platform's own entropy only name the stream, which rng.js owns
+const music = createMusic(typeof CELLWAR_MUSIC === 'string' ? CELLWAR_MUSIC : C.MUSIC.src, C.MUSIC.gain,
+  `music|${Date.now().toString(36)}|${Math.random().toString(36).slice(2)}`);
 ctl.setMusic = byId('set-music');
 // every stage open (his testing ruling 2026-11-23, C.TEST_UNLOCK_ALL_STAGES); progress.js keeps the rule
 const ALL = C.TEST_UNLOCK_ALL_STAGES;
